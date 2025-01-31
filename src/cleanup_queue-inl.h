@@ -3,18 +3,12 @@
 
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
-#include "base_object.h"
+#include <compare>
+
 #include "cleanup_queue.h"
-#include "memory_tracker-inl.h"
 #include "util.h"
 
 namespace node {
-
-inline void CleanupQueue::MemoryInfo(MemoryTracker* tracker) const {
-  ForEachBaseObject([&](BaseObject* obj) {
-    if (obj->IsDoneInitializing()) tracker->Track(obj);
-  });
-}
 
 inline size_t CleanupQueue::SelfSize() const {
   return sizeof(CleanupQueue) +
@@ -37,22 +31,16 @@ void CleanupQueue::Remove(Callback cb, void* arg) {
   cleanup_hooks_.erase(search);
 }
 
-template <typename T>
-void CleanupQueue::ForEachBaseObject(T&& iterator) const {
-  std::vector<CleanupHookCallback> callbacks = GetOrdered();
-
-  for (const auto& hook : callbacks) {
-    BaseObject* obj = GetBaseObject(hook);
-    if (obj != nullptr) iterator(obj);
+constexpr std::strong_ordering CleanupQueue::CleanupHookCallback::operator<=>(
+    const CleanupHookCallback& other) const noexcept {
+  if (insertion_order_counter_ > other.insertion_order_counter_) {
+    return std::strong_ordering::greater;
   }
-}
 
-BaseObject* CleanupQueue::GetBaseObject(
-    const CleanupHookCallback& callback) const {
-  if (callback.fn_ == BaseObject::DeleteMe)
-    return static_cast<BaseObject*>(callback.arg_);
-  else
-    return nullptr;
+  if (insertion_order_counter_ < other.insertion_order_counter_) {
+    return std::strong_ordering::less;
+  }
+  return std::strong_ordering::equivalent;
 }
 
 }  // namespace node

@@ -3,6 +3,7 @@
 
 #if defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
 
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_set>
@@ -11,8 +12,6 @@
 #include "memory_tracker.h"
 
 namespace node {
-
-class BaseObject;
 
 class CleanupQueue : public MemoryRetainer {
  public:
@@ -24,7 +23,7 @@ class CleanupQueue : public MemoryRetainer {
   CleanupQueue(const CleanupQueue&) = delete;
 
   SET_MEMORY_INFO_NAME(CleanupQueue)
-  inline void MemoryInfo(node::MemoryTracker* tracker) const override;
+  SET_NO_MEMORY_INFO()
   inline size_t SelfSize() const override;
 
   inline bool empty() const;
@@ -32,9 +31,6 @@ class CleanupQueue : public MemoryRetainer {
   inline void Add(Callback cb, void* arg);
   inline void Remove(Callback cb, void* arg);
   void Drain();
-
-  template <typename T>
-  inline void ForEachBaseObject(T&& iterator) const;
 
  private:
   class CleanupHookCallback {
@@ -45,6 +41,9 @@ class CleanupQueue : public MemoryRetainer {
         : fn_(fn),
           arg_(arg),
           insertion_order_counter_(insertion_order_counter) {}
+
+    constexpr std::strong_ordering operator<=>(
+        const CleanupHookCallback& other) const noexcept;
 
     // Only hashes `arg_`, since that is usually enough to identify the hook.
     struct Hash {
@@ -68,7 +67,6 @@ class CleanupQueue : public MemoryRetainer {
   };
 
   std::vector<CleanupHookCallback> GetOrdered() const;
-  inline BaseObject* GetBaseObject(const CleanupHookCallback& callback) const;
 
   // Use an unordered_set, so that we have efficient insertion and removal.
   std::unordered_set<CleanupHookCallback,
