@@ -4,11 +4,13 @@
 
 #include "src/builtins/builtins-utils-gen.h"
 #include "src/builtins/builtins.h"
-#include "src/codegen/code-stub-assembler.h"
+#include "src/codegen/code-stub-assembler-inl.h"
 #include "src/objects/objects.h"
 
 namespace v8 {
 namespace internal {
+
+#include "src/codegen/define-code-stub-assembler-macros.inc"
 
 class SharedArrayBufferBuiltinsAssembler : public CodeStubAssembler {
  public:
@@ -816,6 +818,8 @@ void SharedArrayBufferBuiltinsAssembler::AtomicBinopBuiltinCommon(
   BIND(&detached_or_out_of_bounds);
   ThrowTypeError(context, MessageTemplate::kDetachedOperation, method_name);
 }
+
+#include "src/codegen/undef-code-stub-assembler-macros.inc"
 
 }  // namespace internal
 }  // namespace v8
