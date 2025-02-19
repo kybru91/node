@@ -51,7 +51,6 @@ class NoGarbageCollectionScope;
 
 namespace testing {
 class Heap;
-class OverrideEmbedderStackStateScope;
 }  // namespace testing
 
 class Platform;
@@ -65,6 +64,10 @@ class PreFinalizerHandler;
 class StatsCollector;
 
 enum class HeapObjectNameForUnnamedObject : uint8_t;
+enum class StickyBits : uint8_t {
+  kDisabled,
+  kEnabled,
+};
 
 class MoveListener {
  public:
@@ -171,16 +174,17 @@ class V8_EXPORT_PRIVATE HeapBase : public cppgc::HeapHandle {
   virtual heap::base::Stack* stack() { return stack_.get(); }
 
   StackSupport stack_support() const { return stack_support_; }
-  const EmbedderStackState* override_stack_state() const {
-    return override_stack_state_.get();
-  }
+
+  // These virtual methods are also present in class GarbageCollector.
+  virtual void set_override_stack_state(EmbedderStackState state) = 0;
+  virtual void clear_overridden_stack_state() = 0;
 
   // Termination drops all roots (clears them out) and runs garbage collections
   // in a bounded fixed point loop  until no new objects are created in
   // destructors. Exceeding the loop bound results in a crash.
   void Terminate();
 
-  bool in_disallow_gc_scope() const { return disallow_gc_scope_ > 0; }
+  virtual bool IsGCForbidden() const;
   bool in_atomic_pause() const { return in_atomic_pause_; }
 
   HeapStatistics CollectStatistics(HeapStatistics::DetailLevel);
@@ -219,6 +223,11 @@ class V8_EXPORT_PRIVATE HeapBase : public cppgc::HeapHandle {
     return supported;
   }
 
+  StickyBits sticky_bits() const {
+    return generational_gc_supported() ? StickyBits::kEnabled
+                                       : StickyBits::kDisabled;
+  }
+
   // Returns whether objects should derive their name from C++ class names. Also
   // requires build-time support through `CPPGC_SUPPORTS_OBJECT_NAMES`.
   HeapObjectNameForUnnamedObject name_of_unnamed_object() const {
@@ -244,6 +253,12 @@ class V8_EXPORT_PRIVATE HeapBase : public cppgc::HeapHandle {
   void LeaveNoGCScope() {
     DCHECK_GT(no_gc_scope_, 0);
     --no_gc_scope_;
+  }
+
+  void EnterDisallowGCScope() { ++disallow_gc_scope_; }
+  void LeaveDisallowGCScope() {
+    DCHECK_GT(disallow_gc_scope_, 0);
+    --disallow_gc_scope_;
   }
 
   using HeapHandle::is_incremental_marking_in_progress;
@@ -311,7 +326,6 @@ class V8_EXPORT_PRIVATE HeapBase : public cppgc::HeapHandle {
   const StackSupport stack_support_;
   EmbedderStackState stack_state_of_prev_gc_ =
       EmbedderStackState::kNoHeapPointers;
-  std::unique_ptr<EmbedderStackState> override_stack_state_;
 
   bool in_atomic_pause_ = false;
 
@@ -328,7 +342,6 @@ class V8_EXPORT_PRIVATE HeapBase : public cppgc::HeapHandle {
   friend class MarkerBase::IncrementalMarkingTask;
   friend class cppgc::subtle::DisallowGarbageCollectionScope;
   friend class cppgc::testing::Heap;
-  friend class cppgc::testing::OverrideEmbedderStackStateScope;
 };
 
 class V8_NODISCARD V8_EXPORT_PRIVATE ClassNameAsHeapObjectNameScope final {

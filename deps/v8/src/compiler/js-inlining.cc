@@ -4,6 +4,8 @@
 
 #include "src/compiler/js-inlining.h"
 
+#include <optional>
+
 #include "src/codegen/optimized-compilation-info.h"
 #include "src/codegen/tick-counter.h"
 #include "src/compiler/access-builder.h"
@@ -133,7 +135,7 @@ Reduction JSInliner::InlineCall(Node* call, Node* new_target, Node* context,
           Replace(use, new_target);
         } else if (index == inlinee_arity_index) {
           // The projection is requesting the number of arguments.
-          Replace(use, jsgraph()->Constant(argument_count));
+          Replace(use, jsgraph()->ConstantNoHole(argument_count));
         } else if (index == inlinee_context_index) {
           // The projection is requesting the inlinee function context.
           Replace(use, context);
@@ -221,7 +223,7 @@ Reduction JSInliner::InlineCall(Node* call, Node* new_target, Node* context,
 
   // Depending on whether the inlinee produces a value, we either replace value
   // uses with said value or kill value uses if no value can be returned.
-  if (values.size() > 0) {
+  if (!values.empty()) {
     int const input_count = static_cast<int>(controls.size());
     Node* control_output = graph()->NewNode(common()->Merge(input_count),
                                             input_count, &controls.front());
@@ -249,8 +251,9 @@ FrameState JSInliner::CreateArtificialFrameState(
   const int parameter_count_with_receiver =
       parameter_count + JSCallOrConstructNode::kReceiverOrNewTargetInputCount;
   const FrameStateFunctionInfo* state_info =
-      common()->CreateFrameStateFunctionInfo(
-          frame_state_type, parameter_count_with_receiver, 0, shared.object());
+      common()->CreateFrameStateFunctionInfo(frame_state_type,
+                                             parameter_count_with_receiver, 0,
+                                             0, shared.object());
 
   const Operator* op = common()->FrameState(
       BytecodeOffset::None(), OutputFrameStateCombine::Ignore(), state_info);
@@ -322,7 +325,7 @@ OptionalSharedFunctionInfoRef JSInliner::DetermineCallTarget(Node* node) {
 
     // The function might have not been called yet.
     if (!function.feedback_vector(broker()).has_value()) {
-      return base::nullopt;
+      return std::nullopt;
     }
 
     // Disallow cross native-context inlining for now. This means that all parts
@@ -335,7 +338,7 @@ OptionalSharedFunctionInfoRef JSInliner::DetermineCallTarget(Node* node) {
     // in the same graph in a compositional way.
     if (!function.native_context(broker()).equals(
             broker()->target_native_context())) {
-      return base::nullopt;
+      return std::nullopt;
     }
 
     return function.shared(broker());
@@ -355,7 +358,7 @@ OptionalSharedFunctionInfoRef JSInliner::DetermineCallTarget(Node* node) {
     return cell.shared_function_info(broker());
   }
 
-  return base::nullopt;
+  return std::nullopt;
 }
 
 // Determines statically known information about the call target (assuming that
@@ -375,7 +378,8 @@ FeedbackCellRef JSInliner::DetermineCallContext(Node* node,
     CHECK(function.feedback_vector(broker()).has_value());
 
     // The inlinee specializes to the context from the JSFunction object.
-    *context_out = jsgraph()->Constant(function.context(broker()), broker());
+    *context_out =
+        jsgraph()->ConstantNoHole(function.context(broker()), broker());
     return function.raw_feedback_cell(broker());
   }
 
@@ -406,14 +410,6 @@ FeedbackCellRef JSInliner::DetermineCallContext(Node* node,
 }
 
 #if V8_ENABLE_WEBASSEMBLY
-static std::string WasmFunctionNameForTrace(wasm::NativeModule* native_module,
-                                            int fct_index) {
-  wasm::StringBuilder builder;
-  native_module->GetNamesProvider()->PrintFunctionName(builder, fct_index);
-  if (builder.length() == 0) return "<no name>";
-  return {builder.start(), builder.length()};
-}
-
 JSInliner::WasmInlineResult JSInliner::TryWasmInlining(
     const JSWasmCallNode& call_node) {
   const JSWasmCallParameters& wasm_call_params = call_node.Parameters();
@@ -442,7 +438,7 @@ JSInliner::WasmInlineResult JSInliner::TryWasmInlining(
   const wasm::FunctionSig* sig = wasm_call_params.signature();
   Graph::SubgraphScope graph_scope(graph());
   WasmGraphBuilder builder(nullptr, zone(), jsgraph(), sig, source_positions_,
-                           WasmGraphBuilder::kNoSpecialParameterMode, isolate(),
+                           WasmGraphBuilder::kJSFunctionAbiMode, isolate(),
                            native_module->enabled_features());
   SourcePosition call_pos = source_positions_->GetSourcePosition(call_node);
   // Calculate hypothetical inlining id, so if we can't inline, we do not add
@@ -470,7 +466,9 @@ Reduction JSInliner::ReduceJSWasmCall(Node* node) {
   // for wasm gc objects).
   WasmInlineResult inline_result;
   if (inline_wasm_fct_if_supported_ && fct_index != -1 && native_module &&
-      native_module->enabled_features().has_gc()) {
+      // Disable inlining for asm.js functions because we haven't tested it
+      // and most asm.js opcodes aren't supported anyway.
+      !is_asmjs_module(native_module->module())) {
     inline_result = TryWasmInlining(call_node);
   }
 
@@ -495,10 +493,15 @@ Reduction JSInliner::ReduceJSWasmCall(Node* node) {
     // surrounding exception handler, if present.
     subgraph_min_node_id = graph()->NodeCount();
 
-    bool set_in_wasm_flag = !inline_result.can_inline_body;
+    // If we inline the body with Turboshaft later (instead of with TurboFan
+    // here), we don't know yet whether we can inline the body or not. Hence,
+    // don't set the thread-in-wasm flag now, and instead do that if _not_
+    // inlining later in Turboshaft.
+    bool set_in_wasm_flag = !(inline_result.can_inline_body ||
+                              v8_flags.turboshaft_wasm_in_js_inlining);
     BuildInlinedJSToWasmWrapper(
         graph()->zone(), jsgraph(), sig, wasm_call_params.module(), isolate(),
-        source_positions_, wasm::WasmFeatures::FromFlags(),
+        source_positions_, wasm::WasmEnabledFeatures::FromFlags(),
         continuation_frame_state, set_in_wasm_flag);
 
     // Extract the inlinee start/end nodes.
@@ -536,7 +539,8 @@ Reduction JSInliner::ReduceJSWasmCall(Node* node) {
   // given JavaScript function (due to the WasmGCLowering being dependent on
   // module-specific type indices).
   Node* wasm_fct_call = nullptr;
-  if (inline_result.can_inline_body) {
+  if (inline_result.can_inline_body ||
+      v8_flags.turboshaft_wasm_in_js_inlining) {
     AllNodes inlined_nodes(local_zone_, wrapper_end_node, graph());
     for (Node* subnode : inlined_nodes.reachable) {
       // Ignore nodes that are not part of the inlinee.
@@ -549,7 +553,16 @@ Reduction JSInliner::ReduceJSWasmCall(Node* node) {
         break;
       }
     }
-    DCHECK(wasm_fct_call != nullptr);
+    DCHECK_IMPLIES(inline_result.can_inline_body, wasm_fct_call != nullptr);
+
+    // Attach information about Wasm call target for Turboshaft Wasm-in-JS-
+    // inlining (see https://crbug.com/353475584) in sidetable.
+    if (v8_flags.turboshaft_wasm_in_js_inlining && wasm_fct_call) {
+      auto [it, inserted] = js_wasm_calls_sidetable_->insert(
+          {wasm_fct_call->id(), &wasm_call_params});
+      USE(it);
+      DCHECK(inserted);
+    }
   }
 
   Node* context = NodeProperties::GetContextInput(node);
@@ -758,6 +771,15 @@ Reduction JSInliner::ReduceJSCall(Node* node) {
   int inlining_id =
       info_->AddInlinedFunction(shared_info->object(), bytecode_array.object(),
                                 source_positions_->GetSourcePosition(node));
+  if (v8_flags.profile_guided_optimization &&
+      feedback_cell.feedback_vector(broker()).has_value() &&
+      feedback_cell.feedback_vector(broker())
+              .value()
+              .object()
+              ->invocation_count_before_stable(kRelaxedLoad) >
+          v8_flags.invocation_count_for_early_optimization) {
+    info_->set_could_not_inline_all_candidates();
+  }
 
   // Create the subgraph for the inlinee.
   Node* start_node;
@@ -901,12 +923,14 @@ Reduction JSInliner::ReduceJSCall(Node* node) {
     Effect effect{NodeProperties::GetEffectInput(node)};
     if (NodeProperties::CanBePrimitive(broker(), call.receiver(), effect)) {
       CallParameters const& p = CallParametersOf(node->op());
-      Node* global_proxy = jsgraph()->Constant(
+      Node* global_proxy = jsgraph()->ConstantNoHole(
           broker()->target_native_context().global_proxy_object(broker()),
           broker());
-      Node* receiver = effect =
-          graph()->NewNode(simplified()->ConvertReceiver(p.convert_mode()),
-                           call.receiver(), global_proxy, effect, start);
+      Node* receiver = effect = graph()->NewNode(
+          simplified()->ConvertReceiver(p.convert_mode()), call.receiver(),
+          jsgraph()->ConstantNoHole(broker()->target_native_context(),
+                                    broker()),
+          global_proxy, effect, start);
       NodeProperties::ReplaceValueInput(node, receiver,
                                         JSCallNode::ReceiverIndex());
       NodeProperties::ReplaceEffectInput(node, effect);
